@@ -1,22 +1,38 @@
 #%%
+import itertools
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from math import ceil
+
 import h5py
-import pandas as pd
-import os
-from scipy.spatial.distance import cdist
-import numpy as np
-import itertools
+import matplotlib.markers
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import scipy
-from tqdm import tqdm
+import scipy.signal
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from pandarallel import pandarallel
+from scipy.spatial.distance import cdist
+from tqdm import tqdm
 
 pandarallel.initialize(progress_bar=True)
 
-data_path = os.getenv("DATA_PATH", "../ANI-1ccx_clean_fullentry.h5")
+data_path = os.getenv("DATA_PATH", "../data/raw/ANI-1ccx_clean_fullentry.h5")
 
 ATOMIC_PAIRS = [x for x in itertools.combinations_with_replacement([1, 6, 7, 8], 2)]
+ATOMIC_NUMBERS = {
+    "H": 1,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+}
+
 average_by_empirical_formula = False
 nbins = 100
 n_formulas = 500
@@ -50,17 +66,43 @@ def load_h5_dataset(path, n_formulas=None, show_progress=True):
     return pd.concat(dframes).reset_index(drop=True)
 
 
-def distances_from_coordinates(coordinates, atomic_numbers):
-    pairwise_distance = cdist(coordinates, coordinates)
-    distances = {pair: [] for pair in ATOMIC_PAIRS}
-    for i, j in zip(*np.triu_indices_from(pairwise_distance, k=1)):
-        atom_atom_distance = pairwise_distance[i, j]
-        atomic_number_pair = tuple(sorted((atomic_numbers[i], atomic_numbers[j])))
-        if atomic_number_pair in distances:
-            distances[atomic_number_pair].append(atom_atom_distance)
+def torch_cdist(x, y=None):
+    x = torch.from_numpy(x)
+    if y is None:
+        return torch.cdist(x, x)
+    else:
+        y = torch.from_numpy(y)
+        return torch.cdist(x, y)
 
+
+def group_distances(distance_matrix, atomic_numbers):
+    distances = {pair: [] for pair in ATOMIC_PAIRS}
+    for i, j in zip(*np.triu_indices_from(distance_matrix, k=1)):
+        atom_atom_distance = distance_matrix[i, j]
+        atomic_number_pair = tuple(sorted((atomic_numbers[i], atomic_numbers[j])))
+        distances[atomic_number_pair].append(atom_atom_distance)
     return distances
 
+
+def distances_from_coordinates(coordinates, atomic_numbers):
+    if len(coordinates.shape) == 2:
+        pairwise_distances = [cdist(coordinates, coordinates)]
+    else:
+        pairwise_distances = torch_cdist(coordinates).numpy()
+
+    if isinstance(atomic_numbers, np.ndarray) and len(atomic_numbers.shape) == 1:
+        atomic_numbers = np.array([atomic_numbers] * len(coordinates))
+    elif isinstance(atomic_numbers, list) and not isinstance(atomic_numbers[0], list):
+        atomic_numbers = [atomic_numbers]
+
+    all_distances = []
+    for pairwise_distance, _atomic_numbers in zip(pairwise_distances, atomic_numbers):
+        all_distances.append(group_distances(pairwise_distance, _atomic_numbers))
+
+    if len(all_distances) == 1:
+        return all_distances[0]
+    else:
+        return all_distances
 
 def calculate_relative_extrema(counts, bins, order=None):
     idx_minima = scipy.signal.argrelmin(counts, order=order)[0]
@@ -75,8 +117,13 @@ def calculate_relative_extrema(counts, bins, order=None):
     return arg_minima, arg_maxima, val_minima, val_maxima
 
 
-def calculate_peaks(counts, bins, **kwargs):
-    idx_minima = scipy.signal.find_peaks(-counts, **kwargs)[0]
+def calculate_peaks(counts, bins, min_dist=None, **kwargs):
+    if min_dist is not None:
+        kwargs["distance"] = max(1, int(min_dist / (bins[1] - bins[0])))
+    else:
+        kwargs["distance"] = None
+
+    idx_minima = scipy.signal.find_peaks(1-counts, **kwargs)[0]
     idx_maxima = scipy.signal.find_peaks(counts, **kwargs)[0]
 
     val_minima = np.asarray(counts[idx_minima])
@@ -97,7 +144,7 @@ def plot_extrema(arg_minima, arg_maxima, val_minima, val_maxima, ax):
             ymax=val / ax.get_ylim()[1],
             linewidth=0.5,
         )
-        ax.scatter(arg, val, color="red", marker="x")
+        ax.scatter(arg, val, color="red", marker= matplotlib.markers.CARETUP, clip_on=False)
 
     ax.set_xticks(arg_minima)
     ax.set_xticklabels([f"{x:.2f}" for x in arg_minima], rotation=90)
@@ -112,7 +159,7 @@ def plot_extrema(arg_minima, arg_maxima, val_minima, val_maxima, ax):
             ymin=val / ax.get_ylim()[1],
             linewidth=0.5,
         )
-        ax.scatter(arg, val, color="green", marker="x")
+        ax.scatter(arg, val, color="green", marker= matplotlib.markers.CARETDOWN, clip_on=False)
         ax.text(arg, top_text_pos, f"{arg:.2f}", rotation=90, va="bottom", ha="center")
 
     return ax
@@ -156,41 +203,116 @@ def plot_hist(counts, bins, ax):
 
 
 class CutoffType(Enum):
-    SHORT = "short"
-    MEDIUM = "medium"
-    LONG = "long"
+    SHORT = "One Peak"
+    MEDIUM = "Two Peaks"
+    LONG = "Three Peaks"
 
 
 def histogram(x, asdict=True, *args, **kwargs):
     x = np.asarray(x)
     x = x[~np.isnan(x)]
+
     counts, bins = np.histogram(x, *args, **kwargs)
     counts = np.concatenate([counts, [np.nan]])
+
     if asdict:
         return {"counts": counts, "bins": bins}
     else:
         return pd.DataFrame({"counts": counts, "bins": bins})
 
 
-def get_cutoffs(arg_minima, cutoff_type: CutoffType = CutoffType.SHORT):
-    if cutoff_type == CutoffType.SHORT:
-        cutoff = arg_minima[0], arg_minima[1]
-    elif cutoff_type == CutoffType.MEDIUM:
-        cutoff = arg_minima[0], arg_minima[2]
-    elif cutoff_type == CutoffType.LONG:
-        cutoff = arg_minima[0], arg_minima[3]
+def get_cutoffs(extrema, bins, cutoff_type: CutoffType = CutoffType.SHORT):
+    arg_minima, arg_maxima, val_minima, val_maxima = extrema
+    min_dist = np.min(bins)
+    arg_minima = arg_minima[arg_maxima[0] < arg_minima]
+    if cutoff_type.value == CutoffType.SHORT.value:
+        cutoff = min_dist, arg_minima[0]
+    elif cutoff_type.value == CutoffType.MEDIUM.value:
+        cutoff = min_dist, arg_minima[min(arg_minima.shape[0] - 1, 1)]
+    elif cutoff_type.value == CutoffType.LONG.value:
+        cutoff = min_dist, arg_minima[min(arg_minima.shape[0] - 1, 2)]
     else:
         raise NotImplementedError("Unknown cutoff type")
 
     return cutoff
 
 
-def plot_annotated_histogram(counts, bins, ax):
-    extrema = calculate_peaks(counts, bins)
+def plot_annotated_histogram(counts, bins, ax, extrema=None):
+    if extrema is None:
+        extrema = calculate_peaks(counts, bins)
+
     ax = plot_hist(counts, bins, ax)
     ax = plot_extrema(*extrema, ax)
     ax = plot_boundaries(bins.min(), bins.max(), ax)
     return ax
+
+
+def load_h5_dataset_compact(path, targets=None):
+    mol_counter = defaultdict(defaultdict)
+    n_atom_counter = defaultdict(int)
+
+    if targets is None:
+        targets = []
+    elif isinstance(targets, str):
+        targets = [targets]
+
+    # Scout the molecule sizes & number of conformations for each molecule
+    with h5py.File(path, "r") as f:
+        for empirical_formula, entry in f.items():
+            num_conformers, num_atoms, _ = entry["coordinates"].shape
+            n_atom_counter[num_atoms] += num_conformers
+            mol_counter[num_atoms][empirical_formula] = num_conformers
+
+    # Sort by number of atoms, then alphabetically by formula
+    n_atom_counter = dict(sorted(n_atom_counter.items(), key=lambda item: item[0]))
+    mol_counter = dict(sorted(mol_counter.items(), key=lambda item: item[0]))
+    for key in mol_counter:
+        mol_counter[key] = dict(sorted(mol_counter[key].items(), key=lambda item: item[0], reverse=True))
+
+    # Preallocate the coordinate and target arrays
+    coordinates = {n: np.empty((count, n, 3), dtype=np.float32) for n, count in n_atom_counter.items()}
+
+    target_vals = {n: np.empty((count, len(targets)), dtype=np.float32) for n, count in n_atom_counter.items()}
+
+    with h5py.File(path, "r") as f:
+        for n_atoms, counter in mol_counter.items():
+            start = 0
+            for mol, n_conformers in counter.items():
+                coordinates[n_atoms][start:start+n_conformers] = f[mol]["coordinates"]
+                for i, target in enumerate(targets):
+                    target_vals[n_atoms][start:start+n_conformers, i] = f[mol][target]
+
+                start += n_conformers
+
+    return mol_counter, coordinates, target_vals
+
+
+@dataclass
+class Dataset:
+    mol_counts: dict
+    coordinates: dict
+    targets: dict
+
+    # Load from file
+    def __init__(self, path, targets=None):
+        self.mol_counts, self.coordinates, self.targets = load_h5_dataset_compact(path, targets=targets)
+
+
+def molecule_to_numbers(molecule: str) -> np.ndarray:
+    counts = re.findall(r'\d+', molecule)
+    elements = re.findall(r"[A-Za-z]+", molecule)
+    numbers = [ATOMIC_NUMBERS[element] for element in elements]
+    numbers = [[int(number)] * int(count) for count, number in zip(counts, numbers)]
+    numbers = list(itertools.chain.from_iterable(numbers))
+    return np.array(numbers, dtype=np.int8)
+
+
+def get_formula_range(formula, mol_counts):
+    atomic_numbers = molecule_to_numbers(formula)
+    num_atoms = atomic_numbers.shape[-1]        
+    start = mol_counts[num_atoms][formula]
+    end = start + mol_counts[num_atoms][formula]
+    return start, end
 
 
 # %%
@@ -229,7 +351,7 @@ if __name__ == "__main__":
 
     fig, axes = plt.subplots(ncols=2, nrows=ceil(len(histograms) / 2), figsize=(20, 20))
     for ax, (pair, hist) in zip(axes.flatten(), histograms.items()):
-        ax = plot_annotated_histogram(**hist, ax=ax)
+        ax = plot_annotated_histogram(**hist, ax=ax, extrema=extrema[pair])
         ax.set_title(f"{pair}", y=1.13, fontsize=20)
 
     plt.subplots_adjust(wspace=0.1, hspace=0.5)
