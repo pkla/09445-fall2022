@@ -179,7 +179,7 @@ def main():
 
             cutoff_type = st.selectbox("Cutoff Type", CutoffType, format_func=lambda x: x.name)
             cols = st.columns(2)
-            lower_bound_add = cols[0].number_input("Add to Lower Bound", value=0.02, min_value=-1.0, max_value=1.0, step=0.01, format="%.3f")
+            lower_bound_add = cols[0].number_input("Add to Lower Bound", value=0.03, min_value=-1.0, max_value=1.0, step=0.01, format="%.3f")
             upper_bound_add = cols[1].number_input("Add to Upper Bound", value=0.00, min_value=-1.0, max_value=1.0, step=0.01, format="%.3f")
             cutoff_strs = []
             cutoffs = {}
@@ -210,7 +210,8 @@ def main():
             st.plotly_chart(fig)
 
             # Bar chart of atoms counts
-            fig =  df["atomic_numbers"].apply(len).value_counts().sort_index().plot.bar(backend="plotly", title="Atom Counts").update_layout(
+            df["num_atoms"] = df["atomic_numbers"].apply(len)
+            fig = df["num_atoms"].value_counts().sort_index().plot.bar(backend="plotly", title="Atom Counts").update_layout(
                 showlegend=False, xaxis_title="Atom Count", yaxis_title="Number of Conformations", 
             )
             fig.update_traces(marker_color="rgb(158,202,225)", marker_line_color="rgb(8,48,107)", marker_line_width=1.5, opacity=0.8)
@@ -230,82 +231,132 @@ def main():
         constr = tuple(st.text_input("Constraints", "-1,+2").split(","))
         ngrid = st.number_input("Number of Grid Points", value=500, min_value=1, max_value=10000, step=1)
 
-    if st.button("Train Model"):
-        opts_dict = {
-            "zs": tuple(atomic_pairs),
-            "model": {
-                "model": "spline",
-                "nknots": nknots,
-                "cutoffs": cutoffs,
-                "deg": deg,
-                "maxder": maxder,
-                "bconds": bconds,
-            },
-            "constr": {
-                "constr": constr,
-                "ngrid": ngrid,
-            },
-        }
+    with st.expander("Model", expanded=True):
+        if st.button("Train Model"):
+            opts_dict = {
+                "zs": tuple(atomic_pairs),
+                "model": {
+                    "model": "spline",
+                    "nknots": nknots,
+                    "cutoffs": cutoffs,
+                    "deg": deg,
+                    "maxder": maxder,
+                    "bconds": bconds,
+                },
+                "constr": {
+                    "constr": constr,
+                    "ngrid": ngrid,
+                },
+            }
 
-        os.chdir(os.path.join(os.path.dirname(__file__), "DFTBrepulsive"))
-        cache_filename = hashlib.sha256(str(opts_dict).encode("utf-8")).hexdigest() + ".pkl"
+            os.chdir(os.path.join(os.path.dirname(__file__), "DFTBrepulsive"))
+            cache_filename = hashlib.sha256(str(opts_dict).encode("utf-8")).hexdigest() + ".pkl"
 
-        if os.path.exists(cache_filename):
-            with st.spinner("Loading cached model..."):
-                with open(cache_filename, "rb") as f:
-                    gamma, generator, target = pickle.load(f)
-        else:
-            dset = AniDataset.from_hdf(data_path)  # type: ignore
-            opts = Options(opts_dict)
-            model = RepulsiveModel(opts)
-            generator = Generator(model.models, model.loc)
+            if os.path.exists(cache_filename):
+                with st.spinner("Loading cached model..."):
+                    with open(cache_filename, "rb") as f:
+                        gamma, generator, target = pickle.load(f)
+            else:
+                dset = AniDataset.from_hdf(data_path)  # type: ignore
+                opts = Options(opts_dict)
+                model = RepulsiveModel(opts)
+                generator = Generator(model.models, model.loc)
 
-            with st.spinner("Generating gammas..."):
-                gammas = generator.get_gammas(dset, num_workers=8)  # type: ignore
+                with st.spinner("Generating gammas..."):
+                    gammas = generator.get_gammas(dset, num_workers=8)  # type: ignore
 
-                total = np.hstack([moldata["ccsd(t)_cbs.energy"] for moldata in dset.values()])
-                electronic = np.hstack(
-                    [moldata["dftb.elec_energy"] for moldata in dset.values()]
-                )
-                target = total - electronic
-                gamma = np.vstack([moldata["gammas"] for moldata in gammas.values()])
+                    total = np.hstack([moldata["ccsd(t)_cbs.energy"] for moldata in dset.values()])
+                    electronic = np.hstack(
+                        [moldata["dftb.elec_energy"] for moldata in dset.values()]
+                    )
+                    target = total - electronic
+                    gamma = np.vstack([moldata["gammas"] for moldata in gammas.values()])
 
-                with open(cache_filename, "wb") as f:
-                    pickle.dump([gamma, generator, target], f)
+                    with open(cache_filename, "wb") as f:
+                        pickle.dump([gamma, generator, target], f)
 
-        os.chdir(os.path.dirname(__file__))
+            os.chdir(os.path.dirname(__file__))
 
-        coefs, residuals, rank, sing_values = np.linalg.lstsq(gamma, target, rcond=1.0e-6)
-        pred = np.dot(gamma, coefs)
-        mae_fit = np.mean(np.abs(pred - target))
-        st.write(f"MAE {mae_fit:.4f} kcal/mol")
-
-        coefs_labels = label_coefs(
-            opts_dict["model"]["nknots"],
-            opts_dict["model"]["deg"],
-            BCONDS[opts_dict["model"]["bconds"]],
-        )
-        labeled_coefs = pd.Series(coefs.flatten(), index=coefs_labels)
-
-        # View the top 20 correlated features
-        columns = ["_".join([str(x) for x in lab]) for lab in coefs_labels]
-        gamma_df = pd.DataFrame(gamma, columns=columns)
-        top_abs_correlations = get_top_abs_correlations(gamma_df, 20)
-        # set column name to correlation 
-        top_abs_correlations.columns = ["Correlation"]
-        st.dataframe(top_abs_correlations)
-        st.caption("Top 20 Correlated Features")
-
-        with st.spinner("Generating feature correlation plot..."):
-            import plotly.express as px
-            fig = px.imshow(gamma_df.corr())
-            fig.update_layout(
-                title="Correlation heatmap",
-                yaxis_nticks=len(gamma_df.columns),
-                height=1000,
-                width=1400,
+            coefs, residuals, rank, sing_values = np.linalg.lstsq(gamma, target, rcond=1.0e-6)
+            pred = np.dot(gamma, coefs)
+            resid = target - pred
+            mae_fit = np.mean(np.abs(resid))
+            mae_per_atom = np.mean(resid / df["num_atoms"])
+            mae_per_heavy_atom = np.mean(resid / df["num_heavy_atoms"])
+            st.write(f"MAE {mae_fit:.4f} kcal/mol")
+            st.write(f"MAE per Atom {mae_per_atom:.4f} kcal/mol")
+            st.write(f"MAE per Heavy Atom {mae_per_heavy_atom:.4f} kcal/mol")
+            coefs_labels = label_coefs(
+                opts_dict["model"]["nknots"],
+                opts_dict["model"]["deg"],
+                BCONDS[opts_dict["model"]["bconds"]],
             )
-            st.plotly_chart(fig)
+            labeled_coefs = pd.Series(coefs.flatten(), index=coefs_labels)
+
+            tabs = st.tabs(["Residuals vs. Predicted", "Scaled Residuals vs. Predicted"])
+            
+            # plot residuals
+            resid_df = pd.DataFrame({"pred": pred, "target": target, "resid": pred - target, "resid_scaled": (pred - target) / df["num_heavy_atoms"]})
+            with tabs[0]:            
+                # fig, ax = plt.subplots(figsize=(10, 5))
+                # resid_df.plot.scatter(x="pred", y="resid", title="Residuals vs. Predicted", xlabel="Predicted (kcal/mol)", ylabel="Residual (kcal/mol)", ax=ax)
+                # # make points smaller with opacity matplotlib
+                # plt.setp(ax.collections, sizes=[10], alpha=0.3)
+                # st.pyplot(fig)
+                fig = resid_df.plot.scatter(x="pred", y="resid", title="Residuals vs. Predicted", backend="plotly").update_layout(showlegend=False, xaxis_title="Predicted (kcal/mol)", yaxis_title="Residual (kcal/mol)")
+                fig.update_traces(marker_color="rgb(158,202,225)", marker_line_color="rgb(8,48,107)", marker_line_width=0.1, opacity=0.4)
+                
+                # add molecule names to hover
+                fig.update_traces()
+                fig.update_layout(hovermode="closest")
+                fig.update_layout(hoverlabel=dict(bgcolor="white", font_size=16, font_family="Rockwell"))
+                fig.update_traces(hovertemplate="<b>%{text}</b><br><br>residual: %{y:.4f}<br>predicted: %{x:.4f}<extra></extra>")
+                fig.data[0].text = resid_df.index
+                fig.update_layout(height=800)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with tabs[1]:
+                # fig, ax = plt.subplots(figsize=(10, 5))
+                # resid_df.plot.scatter(x="pred", y="resid_scaled", title="Scaled Residuals vs. Predicted", xlabel="Predicted (kcal/mol)", ylabel="Residual (kcal/mol)", ax=ax)
+                # # make points smaller with opacity matplotlib
+                # plt.setp(ax.collections, sizes=[10], alpha=0.3)
+                # st.pyplot(fig)
+                
+                fig = resid_df.plot.scatter(x="pred", y="resid_scaled", title="Scaled Residuals vs. Predicted", backend="plotly").update_layout(showlegend=False, xaxis_title="Predicted (kcal/mol)", yaxis_title="Residual (kcal/mol)")
+                fig.update_traces(marker_color="rgb(158,202,225)", marker_line_color="rgb(8,48,107)", marker_line_width=0.1, opacity=0.4)
+                
+                # add molecule names to hover
+                fig.update_traces()
+                fig.update_layout(hovermode="closest")
+                fig.update_layout(hoverlabel=dict(bgcolor="white", font_size=16, font_family="Rockwell"))
+                fig.update_traces(hovertemplate="<b>%{text}</b><br><br>residual: %{y:.4f}<br>predicted: %{x:.4f}<extra></extra>")
+                fig.data[0].text = resid_df.index
+                fig.update_layout(height=800)
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.caption("Scaled by number of heavy atoms")
+
+            # # View the top 20 correlated features
+            columns = ["_".join([str(x) for x in lab]) for lab in coefs_labels]
+            gamma_df = pd.DataFrame(gamma, columns=columns)
+            # top_abs_correlations = get_top_abs_correlations(gamma_df, 20)
+            # # set column name to correlation 
+            # top_abs_correlations.columns = ["Correlation"]
+            # st.dataframe(top_abs_correlations)
+            # st.caption("Top 20 Correlated Features")
+
+            with st.spinner("Generating feature correlation plot..."):
+                import plotly.express as px
+                fig = px.imshow(gamma_df.corr())
+                fig.update_layout(
+                    title="Correlation heatmap",
+                    yaxis_nticks=len(gamma_df.columns),
+                    height=1000,
+                    width=1000,
+                )
+                # remove colorbar
+                fig.update_layout(coloraxis_showscale=False)
+                st.plotly_chart(fig)
 
 
 if __name__ == "__main__":
