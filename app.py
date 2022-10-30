@@ -17,10 +17,13 @@ from dataset import (
     load_h5_dataset,
     plot_annotated_histogram,
     CutoffType,
+    pdist_mol,
+    density_sensitive_grid
 )
 import hashlib
 import pickle
 import itertools
+import plotly.express as px
 
 os.chdir(os.path.join(os.path.dirname(__file__), "DFTBrepulsive"))
 from data.dataset import AniDataset
@@ -49,11 +52,18 @@ def load_dataset_cached(data_path, n_formulas=None, average_by_empirical_formula
         axis=1,
         result_type="expand",
     )
+    # df_dist = df.parallel_apply(
+    #     lambda row: pdist_mol(
+    #         row["coordinates"], row["atomic_numbers"]
+    #     ),
+    #     axis=1,
+    #     result_type="expand",
+    # )
 
     if average_by_empirical_formula:
         distances = df_dist.applymap(np.mean)
     else:
-        distances = df_dist.apply(np.concatenate, axis=0).apply(pd.Series).T
+        distances = df_dist.apply(lambda x: np.concatenate([z for z in x if not np.isnan(z).any()]), axis=0).apply(pd.Series).T
 
     return df, distances
 
@@ -91,7 +101,6 @@ def get_top_abs_correlations(df, n=5):
     return au_corr[0:n]
 
 
-
 def main():
     st.set_page_config(page_title="ANI-1ccx Dataset", layout="wide")
     st.title("ANI-1ccx Dataset Explorer")
@@ -121,8 +130,8 @@ def main():
 
         st.subheader("Peak Finding")
         min_height = st.number_input("Minimum Height", value=0.1, min_value=0.0, max_value=1.0, step=0.01)
-        min_dist = st.number_input("Minimum Horizontal Distance", value=0.2, min_value=0.0, max_value=1.0, step=0.001, format="%.3f",  help="Required minimal horizontal distance between neighbouring peaks in Angstrom")
-        prominence = st.number_input("Prominence", value=0.005, min_value=0.0, max_value=1.0, step=0.001, format="%.3f", help="The prominence of a peak measures how much a peak stands out from the surrounding baseline of the signal and is defined as the vertical distance between the peak and its lowest contour line.")
+        min_dist = st.number_input("Minimum Horizontal Distance", value=0.35, min_value=0.0, max_value=1.0, step=0.001, format="%.3f",  help="Required minimal horizontal distance between neighbouring peaks in Angstrom")
+        prominence = st.number_input("Prominence", value=0.085, min_value=0.0, max_value=1.0, step=0.001, format="%.3f", help="The prominence of a peak measures how much a peak stands out from the surrounding baseline of the signal and is defined as the vertical distance between the peak and its lowest contour line.")
 
     if True or st.button("Load Data"):
         with st.spinner("Loading Data..."):
@@ -228,8 +237,52 @@ def main():
         deg = st.number_input("Degree", value=3, min_value=1, max_value=10, step=1)
         maxder = st.number_input("Max Derivative", value=2, min_value=0, max_value=10, step=1)
         bconds = st.selectbox("Boundary Conditions", BCONDS.keys(), index=2)
-        constr = tuple(st.text_input("Constraints", "-1,+2").split(","))
-        ngrid = st.number_input("Number of Grid Points", value=500, min_value=1, max_value=10000, step=1)
+        
+        if st.checkbox("Derivative Constraints"):
+            constr = tuple(st.text_input("Constraints", "-1,+2").split(","))
+            ngrid = st.number_input("Number of Grid Points", value=500, min_value=1, max_value=10000, step=1)
+            constr = {"constr": constr, "ngrid": ngrid}
+        else:
+            constr = None
+        weighted_sampling = st.checkbox("Weighted Knot Sampling", value=True)
+        
+        if weighted_sampling:
+            grids = {}
+            st.subheader(f"Knot Sampling Density")
+            cols = st.columns(2)
+            lower_density = cols[0].number_input("Minimum Density", value=0.001, min_value=0.0, max_value=10.0, step=0.001, format="%.5f", key=f"denselower")
+            upper_density = cols[1].number_input("Maximum Density", value=0.01, min_value=0.0, max_value=10.0, step=0.001, format="%.5f", key=f"denseupper")
+            for pair in atomic_pairs:
+                pair_dists = distances[pair]
+                pair_dists = pair_dists[(pair_dists < cutoffs[pair][1]) & (pair_dists > cutoffs[pair][0])]
+                grids[pair] = density_sensitive_grid(pair_dists, nknots, lower_density, upper_density)
+        else:
+            grids = {}
+    
+    
+    if weighted_sampling:
+        with st.expander("Weighted Knot Sampling", expanded=True):
+            fig, ax = plt.subplots(nrows=len(atomic_pairs), ncols=1, figsize=(8, 1 * len(atomic_pairs)), constrained_layout=True, sharex=True)
+            for i, (pair, grid) in enumerate(grids.items()):
+                # plot density of points
+                # vertical lines at knots
+                ax[i].vlines(grid, 0, 1, color="red", alpha=0.5)
+                ax[i].set_ylim(-0.1, 1.1)
+                # remove y axis
+                ax[i].set_yticks([])
+                ax[i].set_ylabel(f"{pair}", rotation=0, labelpad=20, fontsize=10)
+                ax[i].set_xlim(0.5, 2)
+
+                # hide x axis ticks
+                if i < len(atomic_pairs) - 1:
+                    # ax[i].set_xticks([])
+                    ax[i].set_xticklabels([])
+            
+            ax[-1].set_xlabel("Interatomic Distance")
+            ax[-1].set_xticks(np.linspace(0.5, 2, 11))
+            ax[-1].set_xticklabels([f"{x:.2f}" for x in np.linspace(0.5, 2, 11)])
+
+            st.pyplot(fig)
 
     with st.expander("Model", expanded=True):
         if st.button("Train Model"):
@@ -243,14 +296,18 @@ def main():
                     "maxder": maxder,
                     "bconds": bconds,
                 },
-                "constr": {
-                    "constr": constr,
-                    "ngrid": ngrid,
-                },
             }
+            
+            if constr:
+                opts_dict["constr"] = constr
+
+            if grids:
+                override = {"xknots": grids}
+            else:
+                override = None
 
             os.chdir(os.path.join(os.path.dirname(__file__), "DFTBrepulsive"))
-            cache_filename = hashlib.sha256(str(opts_dict).encode("utf-8")).hexdigest() + ".pkl"
+            cache_filename = hashlib.sha256(f"{opts_dict}_{override}".encode("utf-8")).hexdigest() + ".pkl"
 
             if os.path.exists(cache_filename):
                 with st.spinner("Loading cached model..."):
@@ -258,12 +315,13 @@ def main():
                         gamma, generator, target = pickle.load(f)
             else:
                 dset = AniDataset.from_hdf(data_path)  # type: ignore
-                opts = Options(opts_dict)
+                opts = Options(opts_dict, override=override)
                 model = RepulsiveModel(opts)
+                
                 generator = Generator(model.models, model.loc)
 
                 with st.spinner("Generating gammas..."):
-                    gammas = generator.get_gammas(dset, num_workers=8)  # type: ignore
+                    gammas = generator.get_gammas(dset, num_workers=12)  # type: ignore
 
                     total = np.hstack([moldata["ccsd(t)_cbs.energy"] for moldata in dset.values()])
                     electronic = np.hstack(
@@ -293,10 +351,12 @@ def main():
             )
             labeled_coefs = pd.Series(coefs.flatten(), index=coefs_labels)
 
-            tabs = st.tabs(["Residuals vs. Predicted", "Scaled Residuals vs. Predicted"])
+            tabs = st.tabs(["Residuals vs. Predicted", "Scaled Residuals vs. Predicted", "Residuals vs. Heavy Atoms"])
             
             # plot residuals
-            resid_df = pd.DataFrame({"pred": pred, "target": target, "resid": pred - target, "resid_scaled": (pred - target) / df["num_heavy_atoms"]})
+            resid_df = pd.DataFrame({"pred": pred, "target": target, "resid": pred - target})
+            resid_df["num_heavy_atoms"] = df["num_heavy_atoms"].reset_index(drop=True).values.astype(int)
+            resid_df["resid_scaled"] = (pred - target) / resid_df["num_heavy_atoms"]
             with tabs[0]:            
                 # fig, ax = plt.subplots(figsize=(10, 5))
                 # resid_df.plot.scatter(x="pred", y="resid", title="Residuals vs. Predicted", xlabel="Predicted (kcal/mol)", ylabel="Residual (kcal/mol)", ax=ax)
@@ -336,6 +396,10 @@ def main():
 
                 st.caption("Scaled by number of heavy atoms")
 
+            with tabs[2]:
+                # residuals vs heavy atoms, plotly boxplot
+                fig = px.box(resid_df, x="num_heavy_atoms", y="resid", title="Residuals vs. Heavy Atoms", labels={"num_heavy_atoms": "Heavy Atoms", "resid": "Residual (kcal/mol)"}, color="num_heavy_atoms", color_discrete_sequence=px.colors.qualitative.Plotly)
+                st.plotly_chart(fig, use_container_width=True)
             # # View the top 20 correlated features
             columns = ["_".join([str(x) for x in lab]) for lab in coefs_labels]
             gamma_df = pd.DataFrame(gamma, columns=columns)
@@ -346,7 +410,6 @@ def main():
             # st.caption("Top 20 Correlated Features")
 
             with st.spinner("Generating feature correlation plot..."):
-                import plotly.express as px
                 fig = px.imshow(gamma_df.corr())
                 fig.update_layout(
                     title="Correlation heatmap",

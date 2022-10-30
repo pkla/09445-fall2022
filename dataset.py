@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from pandarallel import pandarallel
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
+from scipy.spatial.distance import pdist
 
 pandarallel.initialize(progress_bar=True)
 
@@ -73,6 +74,27 @@ def torch_cdist(x, y=None):
     else:
         y = torch.from_numpy(y)
         return torch.cdist(x, y)
+
+
+def pdist_mol(coordinates, atomic_numbers):
+    zs = itertools.combinations_with_replacement(atomic_numbers, 2)
+    zs = list(set(tuple(sorted(z)) for z in zs))
+    if coordinates.ndim == 2:
+        ds = pdist(coordinates)
+    elif coordinates.ndim == 3:
+        ds = np.vstack([pdist(co) for co in coordinates])
+    else:
+        raise ValueError()
+
+    res = defaultdict(list)
+    for z, d in zip(zs, ds if ds.ndim == 1 else ds.T):
+        z = tuple(sorted(z))
+        res[z].append(d)
+
+    res = {z: np.asarray(res[z]) if ds.ndim == 1 else np.concatenate(res[z])
+           for z in zs}
+    
+    return res
 
 
 def group_distances(distance_matrix, atomic_numbers):
@@ -246,6 +268,33 @@ def plot_annotated_histogram(counts, bins, ax, extrema=None):
     ax = plot_boundaries(bins.min(), bins.max(), ax)
     return ax
 
+import scipy.stats
+import scipy.interpolate
+
+def density_sensitive_grid(x, n_points: int, min_density: float, max_density: float):
+    start = x.min()
+    end = x.max()
+
+    x = x[~np.isnan(x)]
+
+    quantiles = np.quantile(x, np.linspace(0, 1, n_points))
+    quantiles -= quantiles.min()
+    quantiles /= quantiles.max()
+
+    quantiles_upsampled = np.interp(np.linspace(0, 1, n_points*10), np.linspace(0, 1, n_points), quantiles)
+    pdf = np.diff(quantiles_upsampled)
+    pdf = np.concatenate([[0], pdf])[::10]
+    pdf = np.clip(pdf, min_density, max_density)
+
+    # pdf = (1+warp*(1/pdf-1))*pdf
+    quantiles = np.cumsum(pdf)
+    quantiles -= quantiles.min()
+    quantiles /= quantiles.max()
+    quantiles *= (end - start)
+    quantiles += start
+    return quantiles
+
+
 
 def load_h5_dataset_compact(path, targets=None):
     mol_counter = defaultdict(defaultdict)
@@ -314,6 +363,8 @@ def get_formula_range(formula, mol_counts):
     end = start + mol_counts[num_atoms][formula]
     return start, end
 
+
+# %%
 
 # %%
 if __name__ == "__main__":
