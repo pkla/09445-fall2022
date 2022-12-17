@@ -1,4 +1,3 @@
-#%%
 import itertools
 import os
 import re
@@ -13,14 +12,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy
+import scipy.interpolate
 import scipy.signal
+import scipy.stats
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pandarallel import pandarallel
-from scipy.spatial.distance import cdist
+from scipy.spatial.distance import cdist, pdist
 from tqdm import tqdm
-from scipy.spatial.distance import pdist
 
 pandarallel.initialize(progress_bar=True)
 
@@ -34,12 +34,15 @@ ATOMIC_NUMBERS = {
     "O": 8,
 }
 
+ATOMIC_LETTERS = {v: k for k, v in ATOMIC_NUMBERS.items()}
+ATOMIC_PAIRS_LETTERS = [(ATOMIC_LETTERS[a], ATOMIC_LETTERS[b]) for a, b in ATOMIC_PAIRS]
+
 average_by_empirical_formula = False
-nbins = 100
-n_formulas = 500
+nbins = 125
+n_formulas = 100000
 
 
-def load_h5_dataset(path, n_formulas=None, show_progress=True):
+def load_h5_dataset(path, n_formulas=None, max_heavy=None, show_progress=True):
     dframes = []
     with h5py.File(path, "r") as f:
         iterator = itertools.islice(f.items(), n_formulas)
@@ -48,17 +51,16 @@ def load_h5_dataset(path, n_formulas=None, show_progress=True):
             iterator = tqdm(iterator, total=n_formulas)
 
         for empirical_formula, entry in iterator:
+            if max_heavy is not None and (np.array(entry["atomic_numbers"]) > 1).sum() > max_heavy:
+                continue
+
             coordinates = list([np.asarray(c) for c in entry["coordinates"]])
             atomic_numbers = list(entry["atomic_numbers"])
             dframes.append(
                 pd.DataFrame(
                     {
-                        "mol": np.array(
-                            [empirical_formula] * len(coordinates), dtype=str
-                        ),
-                        "iconf": np.array(
-                            list(range(len(coordinates))), dtype=np.int32
-                        ),
+                        "mol": np.array([empirical_formula] * len(coordinates), dtype=str),
+                        "iconf": np.array(list(range(len(coordinates))), dtype=np.int32),
                         "atomic_numbers": [atomic_numbers] * len(coordinates),
                         "coordinates": coordinates,
                     },
@@ -76,9 +78,9 @@ def torch_cdist(x, y=None):
         return torch.cdist(x, y)
 
 
-def pdist_mol(coordinates, atomic_numbers):
-    zs = itertools.combinations_with_replacement(atomic_numbers, 2)
-    zs = list(set(tuple(sorted(z)) for z in zs))
+def pdist_mol(coordinates, atomic_numbers, reference_pairs=None):
+    zs = itertools.combinations(atomic_numbers, 2)
+    zs = list(tuple(sorted(z)) for z in zs)
     if coordinates.ndim == 2:
         ds = pdist(coordinates)
     elif coordinates.ndim == 3:
@@ -91,9 +93,13 @@ def pdist_mol(coordinates, atomic_numbers):
         z = tuple(sorted(z))
         res[z].append(d)
 
-    res = {z: np.asarray(res[z]) if ds.ndim == 1 else np.concatenate(res[z])
-           for z in zs}
-    
+    if reference_pairs is not None:
+        for z in reference_pairs:
+            if z not in res:
+                res[z] = [] if ds.ndim == 1 else [[] for _ in range(ds.shape[1])]
+
+    res = {z: np.asarray(res[z]) if ds.ndim == 1 else np.concatenate(res[z]) for z in zs}
+
     return res
 
 
@@ -126,6 +132,7 @@ def distances_from_coordinates(coordinates, atomic_numbers):
     else:
         return all_distances
 
+
 def calculate_relative_extrema(counts, bins, order=None):
     idx_minima = scipy.signal.argrelmin(counts, order=order)[0]
     idx_maxima = scipy.signal.argrelmax(counts, order=order)[0]
@@ -145,7 +152,7 @@ def calculate_peaks(counts, bins, min_dist=None, **kwargs):
     else:
         kwargs["distance"] = None
 
-    idx_minima = scipy.signal.find_peaks(1-counts, **kwargs)[0]
+    idx_minima = scipy.signal.find_peaks(1 - counts, **kwargs)[0]
     idx_maxima = scipy.signal.find_peaks(counts, **kwargs)[0]
 
     val_minima = np.asarray(counts[idx_minima])
@@ -166,7 +173,7 @@ def plot_extrema(arg_minima, arg_maxima, val_minima, val_maxima, ax):
             ymax=val / ax.get_ylim()[1],
             linewidth=0.5,
         )
-        ax.scatter(arg, val, color="red", marker= matplotlib.markers.CARETUP, clip_on=False)
+        ax.scatter(arg, val, color="red", marker=matplotlib.markers.CARETUP, clip_on=False)
 
     ax.set_xticks(arg_minima)
     ax.set_xticklabels([f"{x:.2f}" for x in arg_minima], rotation=90)
@@ -181,7 +188,7 @@ def plot_extrema(arg_minima, arg_maxima, val_minima, val_maxima, ax):
             ymin=val / ax.get_ylim()[1],
             linewidth=0.5,
         )
-        ax.scatter(arg, val, color="green", marker= matplotlib.markers.CARETDOWN, clip_on=False)
+        ax.scatter(arg, val, color="green", marker=matplotlib.markers.CARETDOWN, clip_on=False)
         ax.text(arg, top_text_pos, f"{arg:.2f}", rotation=90, va="bottom", ha="center")
 
     return ax
@@ -268,8 +275,6 @@ def plot_annotated_histogram(counts, bins, ax, extrema=None):
     ax = plot_boundaries(bins.min(), bins.max(), ax)
     return ax
 
-import scipy.stats
-import scipy.interpolate
 
 def density_sensitive_grid(x, n_points: int, min_density: float, max_density: float):
     start = x.min()
@@ -281,7 +286,9 @@ def density_sensitive_grid(x, n_points: int, min_density: float, max_density: fl
     quantiles -= quantiles.min()
     quantiles /= quantiles.max()
 
-    quantiles_upsampled = np.interp(np.linspace(0, 1, n_points*10), np.linspace(0, 1, n_points), quantiles)
+    quantiles_upsampled = np.interp(
+        np.linspace(0, 1, n_points * 10), np.linspace(0, 1, n_points), quantiles
+    )
     pdf = np.diff(quantiles_upsampled)
     pdf = np.concatenate([[0], pdf])[::10]
     pdf = np.clip(pdf, min_density, max_density)
@@ -290,10 +297,9 @@ def density_sensitive_grid(x, n_points: int, min_density: float, max_density: fl
     quantiles = np.cumsum(pdf)
     quantiles -= quantiles.min()
     quantiles /= quantiles.max()
-    quantiles *= (end - start)
+    quantiles *= end - start
     quantiles += start
     return quantiles
-
 
 
 def load_h5_dataset_compact(path, targets=None):
@@ -316,20 +322,26 @@ def load_h5_dataset_compact(path, targets=None):
     n_atom_counter = dict(sorted(n_atom_counter.items(), key=lambda item: item[0]))
     mol_counter = dict(sorted(mol_counter.items(), key=lambda item: item[0]))
     for key in mol_counter:
-        mol_counter[key] = dict(sorted(mol_counter[key].items(), key=lambda item: item[0], reverse=True))
+        mol_counter[key] = dict(
+            sorted(mol_counter[key].items(), key=lambda item: item[0], reverse=True)
+        )
 
     # Preallocate the coordinate and target arrays
-    coordinates = {n: np.empty((count, n, 3), dtype=np.float32) for n, count in n_atom_counter.items()}
+    coordinates = {
+        n: np.empty((count, n, 3), dtype=np.float32) for n, count in n_atom_counter.items()
+    }
 
-    target_vals = {n: np.empty((count, len(targets)), dtype=np.float32) for n, count in n_atom_counter.items()}
+    target_vals = {
+        n: np.empty((count, len(targets)), dtype=np.float32) for n, count in n_atom_counter.items()
+    }
 
     with h5py.File(path, "r") as f:
         for n_atoms, counter in mol_counter.items():
             start = 0
             for mol, n_conformers in counter.items():
-                coordinates[n_atoms][start:start+n_conformers] = f[mol]["coordinates"]
+                coordinates[n_atoms][start : start + n_conformers] = f[mol]["coordinates"]
                 for i, target in enumerate(targets):
-                    target_vals[n_atoms][start:start+n_conformers, i] = f[mol][target]
+                    target_vals[n_atoms][start : start + n_conformers, i] = f[mol][target]
 
                 start += n_conformers
 
@@ -344,11 +356,13 @@ class Dataset:
 
     # Load from file
     def __init__(self, path, targets=None):
-        self.mol_counts, self.coordinates, self.targets = load_h5_dataset_compact(path, targets=targets)
+        self.mol_counts, self.coordinates, self.targets = load_h5_dataset_compact(
+            path, targets=targets
+        )
 
 
 def molecule_to_numbers(molecule: str) -> np.ndarray:
-    counts = re.findall(r'\d+', molecule)
+    counts = re.findall(r"\d+", molecule)
     elements = re.findall(r"[A-Za-z]+", molecule)
     numbers = [ATOMIC_NUMBERS[element] for element in elements]
     numbers = [[int(number)] * int(count) for count, number in zip(counts, numbers)]
@@ -358,7 +372,7 @@ def molecule_to_numbers(molecule: str) -> np.ndarray:
 
 def get_formula_range(formula, mol_counts):
     atomic_numbers = molecule_to_numbers(formula)
-    num_atoms = atomic_numbers.shape[-1]        
+    num_atoms = atomic_numbers.shape[-1]
     start = mol_counts[num_atoms][formula]
     end = start + mol_counts[num_atoms][formula]
     return start, end
@@ -371,19 +385,27 @@ if __name__ == "__main__":
     df = load_h5_dataset(data_path, n_formulas=n_formulas)
 
     # %%
-    df[ATOMIC_PAIRS] = df.parallel_apply(
-        lambda row: distances_from_coordinates(
-            row["coordinates"], row["atomic_numbers"]
-        ),
+    df["num_heavy_atoms"] = df["atomic_numbers"].parallel_apply(
+        lambda x: len(x) - np.sum(np.array(x) == 1)
+    )
+
+    df = df.query("num_heavy_atoms <= 8")
+
+    df_dist = df.parallel_apply(
+        lambda row: pdist_mol(row["coordinates"], row["atomic_numbers"], ATOMIC_PAIRS),
         axis=1,
         result_type="expand",
     )
 
     # %%
     if average_by_empirical_formula:
-        distances = df.set_index("mol")[ATOMIC_PAIRS].applymap(np.mean)
+        distances = df_dist.applymap(np.mean)
     else:
-        distances = df[ATOMIC_PAIRS].apply(np.concatenate, axis=0).apply(pd.Series).T
+        distances = (
+            df_dist.apply(lambda x: np.concatenate([z for z in x if not np.isnan(z).any()]), axis=0)
+            .apply(pd.Series)
+            .T
+        )
 
     # %%
     ax = distances.hist(bins=nbins, figsize=(20, 20))
@@ -394,7 +416,13 @@ if __name__ == "__main__":
     histograms = {pair: histogram(distances[pair], bins=nbins) for pair in ATOMIC_PAIRS}
 
     extrema = {
-        pair: calculate_peaks(histograms[pair]["counts"], histograms[pair]["bins"])
+        pair: calculate_peaks(
+            histograms[pair]["counts"],
+            histograms[pair]["bins"],
+            min_dist=0.35,
+            height=0.1,
+            prominence=0.085,
+        )
         for pair in ATOMIC_PAIRS
     }
 
